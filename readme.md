@@ -779,7 +779,9 @@ without a format (`vk: fsr3: ... can run on this GPU` in the log). It upscales o
 scene's colour, its depth, motion from the camera with the skinned characters' own drawn over it (Link, his shield and
 the people around him keep their outline while they move), and the same camera jitter (`RX_VK_FSR_JITTER=0` turns it
 off). Things that move by themselves and are not skinned (Navi's body, props) can still trail. `RX_VK_FSR3_CHAIN=0` gives
-it the camera's motion alone, as before.
+it the camera's motion alone, as before. With HDR on **Native**, it takes the game's HDR colour as linear light, so
+highlights above the paper white are kept (`RX_VK_FSR3_HDR=0`: cut at the paper white, as before; with
+`RX_VK_FSR3_CHAIN=0` they are cut too).
 
 </details>
 
