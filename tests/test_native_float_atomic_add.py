@@ -88,6 +88,13 @@ struct EmitContext : Sirit::Module {
     bool native_f32_add{};
     Id Const(u32 value) { return Constant(U32[1], value); }
     Id Def(const IR::Value&) { return u32_zero_value; }
+    // (as EmitContext::LoadWorkgroup: NonPrivatePointer only for a staged matrix program on the Vulkan memory model, which
+    // this fixture's GLSL450 module is not)
+    bool workgroup_non_private{};
+    Id LoadWorkgroup(Id result_type, Id pointer) {
+        return workgroup_non_private ? OpLoad(result_type, pointer, spv::MemoryAccessMask::NonPrivatePointer)
+                                     : OpLoad(result_type, pointer);
+    }
     void define_storage_buffers(const Info& info);
 };
 @@CAS@@
