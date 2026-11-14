@@ -461,6 +461,14 @@ HLE(_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE) {
     G64(ARG(0)) = (uint64_t)sz.QuadPart;
     RET(0);
 }
+/* (hookshot) A save's calls (a write, a size change, a flush, the close of a file opened for writing, a file or folder
+   made, deleted or renamed) give the virtual core up around their host file calls too, as OpenFile and ReadFile do:
+   Horizon runs another thread on the core while this one waits for the file system, and these wait for the disk
+   (FlushFile is an fdatasync on Linux, host/posix/win32_posix.c; FlushFileBuffers on Windows). With the core held, OoT's
+   gmd::SaveDataMgr kept core 2 through a save in Kakariko for about 20 s while better threads asked for it: the threads
+   that wait for that core (ModuleSystemWorker2, PreActorModelCompose, ...) ran only at vc_acquire's 2 s escapes, and one
+   frame took 10.2 s. A failed call's error is read before the core is taken again (the wait for a core sets the last
+   error when it times out). */
 /* WriteFile(FileHandle, long offset, void const* buf, unsigned long size, WriteOption const&) */
 HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     Handle *fh = get_handle(c, ARG(0));
@@ -469,21 +477,35 @@ HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
     ov.OffsetHigh = (DWORD)(ARG(1) >> 32);
     DWORD put = 0;
     /* (hookshot) from guest memory only, and the whole size: a DWORD cut wrote less than asked and said so */
-    if (ARG(3) <= 0xFFFFFFFFu && hos_guest_range(ARG(2), ARG(3))) WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
+    if (ARG(3) <= 0xFFFFFFFFu && hos_guest_range(ARG(2), ARG(3))) {
+        const int away = hos_vcore_away();   /* (as OpenFile: no core held through the write) */
+        WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
+        if (away) hos_vcore_back();
+    }
     RET(put == ARG(3) ? 0 : 0x2EE202);
 }
 HLE(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl) {
     Handle *fh = get_handle(c, ARG(0));
     LARGE_INTEGER sz;
     sz.QuadPart = (LONGLONG)ARG(1);
+    const int away = hos_vcore_away();
     SetFilePointerEx(fh->h, sz, NULL, FILE_BEGIN);
     SetEndOfFile(fh->h);
+    if (away) hos_vcore_back();
     RET(0);
 }
-HLE(_ZN2nn2fs9FlushFileENS0_10FileHandleE) { FlushFileBuffers(get_handle(c, ARG(0))->h); RET(0); }
+HLE(_ZN2nn2fs9FlushFileENS0_10FileHandleE) {
+    Handle *fh = get_handle(c, ARG(0));
+    const int away = hos_vcore_away();   /* (an fdatasync on Linux: it waits for the disk) */
+    FlushFileBuffers(fh->h);
+    if (away) hos_vcore_back();
+    RET(0);
+}
 HLE(_ZN2nn2fs9CloseFileENS0_10FileHandleE) {
     Handle *fh = get_handle(c, ARG(0));
+    const int away = fh->writable ? hos_vcore_away() : 0;   /* (a file read is closed with the core, as before) */
     CloseHandle(fh->h);
+    if (away) hos_vcore_back();
     free_handle(ARG(0));
     free(fh);
 }
@@ -493,28 +515,42 @@ HLE(_ZN2nn2fs10CreateFileEPKcl) {
     char path[HOS_FS_PATH];
     int writable = 0;
     if (!host_path(gstr(ARG(0)), path, sizeof path, &writable) || !writable) { RET(R_PATH_NOT_FOUND); return; }
+    const int away = hos_vcore_away();
     make_dirs(path);
     HANDLE h = CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) { RET(GetLastError() == ERROR_FILE_EXISTS ? R_PATH_EXISTS : R_PATH_NOT_FOUND); return; }
+    if (h == INVALID_HANDLE_VALUE) {
+        const DWORD e = GetLastError();
+        if (away) hos_vcore_back();
+        RET(e == ERROR_FILE_EXISTS ? R_PATH_EXISTS : R_PATH_NOT_FOUND);
+        return;
+    }
     LARGE_INTEGER sz;
     sz.QuadPart = (LONGLONG)ARG(1);
     SetFilePointerEx(h, sz, NULL, FILE_BEGIN);
     SetEndOfFile(h);
     CloseHandle(h);
+    if (away) hos_vcore_back();
     RET(0);
 }
 HLE(_ZN2nn2fs10DeleteFileEPKc) {
     char path[HOS_FS_PATH];
     int writable = 0;
-    if (!host_path(gstr(ARG(0)), path, sizeof path, &writable) || !writable || !DeleteFileA(path)) { RET(R_PATH_NOT_FOUND); return; }
-    RET(0);
+    if (!host_path(gstr(ARG(0)), path, sizeof path, &writable) || !writable) { RET(R_PATH_NOT_FOUND); return; }
+    const int away = hos_vcore_away();
+    const BOOL deleted = DeleteFileA(path);
+    if (away) hos_vcore_back();
+    RET(deleted ? 0 : R_PATH_NOT_FOUND);
 }
 HLE(_ZN2nn2fs15CreateDirectoryEPKc) {
     char path[HOS_FS_PATH];
     int writable = 0;
     if (!host_path(gstr(ARG(0)), path, sizeof path, &writable) || !writable) { RET(R_PATH_NOT_FOUND); return; }
+    const int away = hos_vcore_away();
     make_dirs(path);
-    RET(CreateDirectoryA(path, NULL) ? 0 : GetLastError() == ERROR_ALREADY_EXISTS ? R_PATH_EXISTS : R_PATH_NOT_FOUND);
+    const BOOL made = CreateDirectoryA(path, NULL);
+    const DWORD e = made ? 0 : GetLastError();
+    if (away) hos_vcore_back();
+    RET(made ? 0 : e == ERROR_ALREADY_EXISTS ? R_PATH_EXISTS : R_PATH_NOT_FOUND);
 }
 static void delete_tree(const char *dir) {
     char pat[HOS_FS_PATH];
@@ -539,21 +575,27 @@ HLE(_ZN2nn2fs26DeleteDirectoryRecursivelyEPKc) {
     char path[HOS_FS_PATH];
     int writable = 0;
     if (!host_path(gstr(ARG(0)), path, sizeof path, &writable) || !writable) { RET(R_PATH_NOT_FOUND); return; }
+    const int away = hos_vcore_away();
     /* (hookshot) the folder named itself a link: the link goes, never what it points to (as for the links inside) */
     const DWORD at = GetFileAttributesA(path);
     if (at != INVALID_FILE_ATTRIBUTES && (at & FILE_ATTRIBUTE_REPARSE_POINT)) {
         if (!DeleteFileA(path)) RemoveDirectoryA(path);
+        if (away) hos_vcore_back();
         RET(0);
         return;
     }
     delete_tree(path);
+    if (away) hos_vcore_back();
     RET(0);
 }
 HLE(_ZN2nn2fs10RenameFileEPKcS2_) {
     char a[HOS_FS_PATH], b[HOS_FS_PATH];
     int w1 = 0, w2 = 0;
     if (!host_path(gstr(ARG(0)), a, sizeof a, &w1) || !host_path(gstr(ARG(1)), b, sizeof b, &w2) || !w1 || !w2) { RET(R_PATH_NOT_FOUND); return; }
-    RET(MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING) ? 0 : R_PATH_NOT_FOUND);
+    const int away = hos_vcore_away();
+    const BOOL moved = MoveFileExA(a, b, MOVEFILE_REPLACE_EXISTING);
+    if (away) hos_vcore_back();
+    RET(moved ? 0 : R_PATH_NOT_FOUND);
 }
 /* a RomFS folder that only mods have: rom:/x -> some mod entry lies under x */
 static void count_extra(void *arg, const char *name, int is_dir, uint64_t size) { (void)name, (void)is_dir, (void)size; ++*(int *)arg; }
