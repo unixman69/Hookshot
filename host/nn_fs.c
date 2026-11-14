@@ -505,9 +505,11 @@ HLE(_ZN2nn2fs9CloseFileENS0_10FileHandleE) {
     Handle *fh = get_handle(c, ARG(0));
     const int away = fh->writable ? hos_vcore_away() : 0;   /* (a file read is closed with the core, as before) */
     CloseHandle(fh->h);
-    if (away) hos_vcore_back();
+    /* (the handle let go before the core is taken again: that wait can last up to the 2 s escape, and its entry would
+       name a closed file meanwhile) */
     free_handle(ARG(0));
     free(fh);
+    if (away) hos_vcore_back();
 }
 
 /* CreateFile(char const*, long size) */

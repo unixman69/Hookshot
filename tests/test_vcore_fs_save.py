@@ -12,6 +12,8 @@ count the host file calls they make and how many of them ran while the thread he
 - the answers are the ones from before: PathAlreadyExists for a file or folder that exists although taking the core
   again sets the last error (vc_acquire's timed wait: ERROR_TIMEOUT), PathNotFound for a failed delete or rename or a
   mount that is not writable, OutOfRange for a short write;
+- a file opened for writing has its handle let go before the core is taken again (that wait can last up to the 2 s
+  escape: the handle's entry is not left naming a closed file meanwhile);
 - a file opened for reading is closed with the core held, as before (no extra wait for a core per file read);
 - a thread that holds no core when it calls them takes none.
 
@@ -94,8 +96,9 @@ static void *hos_guest_range(uint64_t a, uint64_t n) { (void)n; return guest_ok 
 static DWORD last_error;
 static DWORD GetLastError(void) { return last_error; }
 static int held, takes;
+static int freed, freed_at_take;   /* (file handles let go, below: so far, and when the core was taken again) */
 int hos_vcore_away(void) { if (!held) return 0; held = 0; return 1; }
-void hos_vcore_back(void) { if (!held) held = 1, takes++, last_error = ERROR_TIMEOUT; }
+void hos_vcore_back(void) { if (!held) held = 1, takes++, freed_at_take = freed, last_error = ERROR_TIMEOUT; }
 
 /* the mount's path */
 static int path_writable = 1;
@@ -144,7 +147,6 @@ static void delete_tree(const char *dir) { (void)dir; host_call(); }
 /* the file handles: one, number 1 */
 typedef struct { HANDLE h; int writable; char path[HOS_FS_PATH]; } Handle;
 static Handle *table[2];
-static int freed;
 static Handle *get_handle(Ctx *c, uint64_t id) { (void)c; return table[id]; }
 static void free_handle(uint64_t id) { table[id] = NULL; freed++; }
 static uint64_t open_handle(int writable) {
@@ -166,7 +168,7 @@ static uint64_t call(Hle f, int core, uint64_t a0, uint64_t a1, uint64_t a2, uin
     Ctx c;
     memset(&c, 0, sizeof c);
     c.x[0] = a0, c.x[1] = a1, c.x[2] = a2, c.x[3] = a3;
-    held = core, takes = 0, calls = with_core = 0, last_error = 0;
+    held = core, takes = 0, calls = with_core = 0, last_error = 0, freed_at_take = -1;
     f(&c);
     return c.x[0];
 }
@@ -218,6 +220,8 @@ int main(void) {
     r = call(CLOSE, 1, 1, 0, 0, 0);
     without_core("CloseFile of a file opened for writing", 1);
     check(freed == 1 && !table[1], "CloseFile: the handle is let go");
+    check(freed_at_take == 1, "CloseFile of a file opened for writing: the handle let go before the core is taken again "
+          "(not left naming a closed file through that wait)");
     open_handle(0);
     r = call(CLOSE, 1, 1, 0, 0, 0);
     check(calls == 1 && with_core == 1 && held == 1 && takes == 0 && freed == 1,
